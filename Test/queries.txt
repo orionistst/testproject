@@ -1,0 +1,656 @@
+--***************************************************************************
+--Detect Blockages
+--***************************************************************************
+SELECT
+  t1.resource_type AS [lock type],
+  DB_NAME(resource_database_id) AS [database],
+  t1.resource_associated_entity_id AS [blk object],
+  t1.request_mode AS [lockreq], --- lock requested
+  t1.request_session_id AS [waiter sid],
+  t2.wait_duration_ms AS [wait time], --spid of waiter
+  (SELECT
+    [text]
+  FROM sys.dm_exec_requests AS r --get sql for waiter
+  CROSS APPLY sys.dm_exec_sql_text(r.[sql handle])
+  WHERE r.session_id = t1.request_session_id)
+  AS [waiter_batch],
+  (SELECT
+    SUBSTRING(qt.[text], r.statement_start_offset / 2,
+    (CASE
+      WHEN r.statement_end_offset - 1 THEN LEN(CONVERT(nvarchar(max), qt.[text])) * 2
+      ELSE r.statement_end_offset
+    END - r.statement_start_pffset) / 2)
+  FROM sys.dm_exec_requests AS r
+  CROSS APPLY sys.dm_exec_sql_text(r.[sql_handle]) AS qt
+  WHERE r.session_id = t1.request_session_id)
+  AS [waiter_stmt], -- statement blocked
+  t2.blocking_session_id AS [blocker sid], --spid of blocker
+  (SELECT
+    [text]
+  FROM sys.sysprocesses AS p   -- get sql for blocker
+  CROSS APPLY sys.dm_exec_sql_text(p.[sql_handle])
+  WHERE p.spid = t2.blocking_session_id)
+  AS [blocker_stmt]
+FROM sys.dm_tran_locks AS ti
+INNER JOIN sys.dm_os_waiting_tasks AS t2
+  ON tl.lock_owner_address = t2.resource_address;
+
+--*************************************************************************** 
+--Check Table Compression
+--*************************************************************************** 
+SELECT
+  SCHEMA_NAME (sys.objects.SCHEMA id) AS [ScnemaName]
+, OBJECT_NAME (sys.objects.objecUd) AS [ObjectName]
+, [rows]
+, [data_compression_desc]
+, [index_id] AS [IndexID_on_Table]
+FROM sys.partitions
+INNER JOIN sys.objects
+  ON sys.partitions.object_id = sys.objects.object_id
+WHERE data_compression > 0
+AND SCHEMA_NAME(sys.objects.schema_id) <> 'SYS'
+AND OBJECT_NAME(sys.objects.object_id) = 'tFundingReportPositionB0Copers'
+AND SCHEMA_NAME(sys.objects.schema_id) = 'Output'
+
+--*************************************************************************** 
+-- Check Role Permission
+--***************************************************************************
+WITH perms_cte
+AS (SELECT
+  p.major_id,
+  USER_NAME(p.grantee_principal_id) AS
+  principal_name,
+  dp.principal_id,
+  dp.type_desc AS principal_type_desc,
+  p.class_desc,
+  SCHEMA_NAME(obj.schema_id) schema_name,
+  OBJECT_NAME(p.majdr_id) AS object_name,
+  p.permission_name,
+  p.state_desc AS Permission_state_desc
+FROM sys.database_permissions p
+INNER JOIN sys.database_principals dp
+  ON p.grantee_principal_id = dp.principal_id
+INNER JOIN sys.objets obj
+  ON p.major_id)
+--role members 
+SELECT
+  major_id,
+  rm.member_principal_name,
+  rm.principal_type_desc,
+  p.class_desc,
+  p.schema_name,
+  p.object_name,
+  p.permission_name,
+  p.permission_state_desc,
+  rm.role_name
+FROM perms_cte p
+RIGHT OUTER JOIN (SELECT
+  role_principal_id,
+  dp.type_desc AS principal_type_desc,
+  member_principal_id,
+  USER_NAME(member_principal_id) AS member_principal_name,
+  USER_NAME(role_principal_id) AS role_name--,* 
+FROM sys.database_role_members rm
+INNER JOIN sys.database_principals dp
+  ON rm.member_principal_id = dp.principal_id) rm
+  ON rm.role_principal_id = p.principal_id
+WHERE rm.member_principal_name = '<Role Name>'
+
+
+--*************************************************************************** 
+--Check if DB snapshot Exists
+--*************************************************************************** 
+IF EXISTS (SELECT
+    *
+  FROM master.sys.databases
+  WHERE source_database_id IS NOT NULL)
+  SELECT
+    [name] + ' is a snapshot'
+  FROM master.sys.databases
+  WHERE source_database_id IS NOT NULL
+ELSE
+  PRINT 'no snapshot found'
+
+
+--***************************************************************************
+--Check CPU Usage
+-- ***************************************************************************
+DECLARE @ts_now bigint
+SELECT
+  @ts_now = cpu_ticks / (cpu_ticks / ms_ticks)
+FROM sys.dm_os_sys_info
+SELECT TOP 20
+  record_id,
+  EventTime,
+  CASE
+    WHEN system_cpu_utilization_post_sp2 IS NOT NULL THEN system_cpu_utilization_post_sp2
+    ELSE system_cpu_utilization_pre_sp2
+  END AS
+  system_cpu_utilization,
+  CASE
+    WHEN sql_cpu_utilization_post_sp2 IS NOT NULL THEN sql_cpu_utilization_post_sp2
+    ELSE sql_cpu_utilization_pre_sp2
+  END AS
+  sql_cpu_utilization
+FROM (SELECT
+  record.value('(Record/@id)[1]', 'int') AS record_id,
+  DATEADD(ms, -1 * (@ts_now - [timestampl]), GETDATE()) AS EventTime,
+  100 -
+  record.value('(Record/SchedulerMonitorEvent/SystemHealth/Systemldle) El] ', 'int') AS system_cpu_utilization_post_sp2,
+  record.value(' (Record/Sc hedulerMonitorEvent/System Health/ProcessUtilization)
+1] ', 'int') AS sql_cpu_utilization_post_sp2,
+  100 -
+  record.value('(Record/SchedluerMonitorEvent/SystemHealth/Systeinldle) (1)',
+  'int') AS system_cpu_utilization_pre_sp2,
+  record.value('(Record/SchedluerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int') AS sql_cpu_utilization_pre_sp2
+FROM (SELECT
+  timestamp,
+  CONVERT(xml, record) AS record
+FROM sys.dm_os_ring_buffers
+WHERE ring_buffer_type = 'RING_BUFFER_SCHEDULER_MONITOR'
+AND record LIKE '%<SystemHealth>%') AS t) AS t
+ORDER BY record_id DESC
+
+--***************************************************************************
+--Check Currently Running SQLs
+--***************************************************************************
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
+SELECT
+  [Spid] = er.session_Id,
+  req.total_elapsed_time / 60000 AS total_elapsed_minutes,
+  req.cpu_time / 60000 AS cpu_minutes,
+  req.command,
+  [Database] = DB_NAME(sp.dbid),
+  [User] = nt_username,
+  [Status] = er.status,
+  [Wait] = er.wait_type,
+  [Individual Query] - SUBSTRING(qt.text,
+  er.statement_start_offset / 2,
+  (CASE
+    WHEN er.statement_end_offset = -1 THEN LEN(CONVERT(nvarchar(max), qt.text)) * 2
+    ELSE er.statement_end_offset
+  END -
+  er.statement_start_offset) / 2),
+  [Parent Query] = qt.text,
+  Program = program_name,
+  Hostname,
+  nt_domain,
+  er.start_time,
+  ecid
+FROM sys.dm_exec_requests er
+INNER JOIN sys.sysprocesses sp
+  ON er.session_id = sp.spid
+INNER JOIN sys.dm_exec_requests req
+  ON er.session_Id = req.session_id
+CROSS APPLY sys.dm_exec_sql_text(er.sql_handle) AS qt
+WHERE er.session_Id > 50 -- Ignore system spids.
+AND er.session_Id NOT IN (@PSPID) -- Ignore this current statement.
+ORDER BY 1, 2
+--***************************************************************************
+--Check File space Usage
+--***************************************************************************
+SELECT
+  b.groupname AS 'File Group',
+  Name,
+  [Filename],
+  CONVERT(decimal(15, 2), ROUND(a.Size / 128.000, 2))
+  [Currently Allocated Space (MB)],
+  CONVERT(decimal(15, 2),
+  ROUND(FILEPROPERTY(a.Name, 'SpaceUsed') / 128.000, 2))
+  AS [Space Used (MB)],
+  CONVERT(decimal(15, 2),
+  ROUND((a.Size - FILEPROPERTY(a.Name, 'SpaceUsed')) / 128.000, 2))
+  AS [Available Space (MB)]
+FROM dbo.sysfiles a (NOLOCK)
+JOIN sysfilegroups b (NOLOCK)
+  ON a.groupid = b.groupid
+ORDER BY b.groupname
+
+--***************************************************************************
+--Check Index Usage of a table
+--***************************************************************************
+SELECT
+  OBJECT NAME (S.[OBJECT_ID]) AS [OBJECT NAME],
+I.[NAME] AS [INDEX NAME],
+USER_SEEKS,
+USER_SCANS,
+USER LOOKUPS,
+USER UPDATES
+FROM SYS.DM_DB_INDEX_USAGE_STATS AS S
+INNER JOIN SYS.INDEXEs AS I
+  ON I.[OBJECT_ID] - S.[OBJECT_ID]
+  AND I.INDex_ID - S.INDEX_ID
+  AND OBJECT_NAME(S.[OBJECT_ID]) = '<Table Name>'
+WHERE OBJECTPROPERTY(i.[OBJECT_ID], 'IsUserTable') = 1
+--***************************************************************************
+--Check time of last Update stats of a table
+--***************************************************************************
+SELECT
+  name AS index_name,
+  STATS_DATE(OBJECT_ID, index_id) AS StatsUpdated
+FROM sys.indexes
+WHERE OBJECT_ID = OBJECT_ID('<tablename with schema>')
+--***************************************************************************
+--Check SQL Execu tion Metrics
+--***************************************************************************
+SELECT
+  qt.text ParentQuery,
+  SUBSTRING(qt.text,
+  qs.statement_start_offset / 2,
+  (CASE
+    WHEN qs.statement_end_offset = -1 THEN LEN(CONVERT(nvarchar(max), qt.text)) * 2
+    ELSE qs.statement_end_offset
+  END -
+  qs.statement_start_offset) / 2) IndividualStatment,
+  qs.plan_generation_num,
+  qs.execution_count,
+  qs.total_elapsed_time,
+  qs.total_worker_time,
+  qs.total_physical_reads,
+  qs.total_logical_writes,
+  qs.total_logical_reads,
+  qs.total_clr_time
+FROM master.sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS qt
+ORDER BY qs.execution_count ASC, qs.total_worker_time DESC
+
+--***************************************************************************
+--Parse XML in Query
+--***************************************************************************
+DECLARE @x xml;
+SET @x = '<ReportingInitResponse xmlns:xsi="http://www.w3.org/2001/XMLSchemainstance"
+xmlns:ns="http://www.example.org/ReportingInitResponse2"
+xmlns:xsd="http://www.w3.org/2001/XMLSchema"><MarginGroupResponse
+MarginGroupID="32904968" Warning="Y">Unallocated trades in Margin
+Group</MarginGroupResponse></ReportingInitResponse>'
+SELECT
+  a.b.value('MarginGroupResponse[1]/@MarginGroupID', 'varchar(50)') AS MGID
+FROM @x.nodes('ReportingInitResponse') a (b)
+--***************************************************************************
+--Rollback Immidiate
+--***************************************************************************
+USE master;
+GO
+ALTER DATABASE AdventureWorks
+SET SINGLE_USER
+WITH ROLLBACK IMMEDIATE;
+ALTER DATABASE AdventureWorks
+SET MULTI_USER;
+GO
+--***************************************************************************
+--Serach a Pattern
+--***************************************************************************
+SELECT
+  ObjType = type_desc,
+  ObjName = SCHEMA_NAME(SCHEMA_ID) + '.' + name,
+  ObjDefLink
+FROM SYS.OBJECTS
+CROSS APPLY (SELECT
+  ObjDef = OBJECT_DEFINITION(object_id)) F1
+CROSS APPLY (SELECT
+  ObjDefLink = (SELECT
+    [processing-instruction(q)] = ObjDef
+  FOR
+  xml PATH (''), TYPE)) F2
+WHERE TYPE IN (/*Search in below*/
+'P'/* Procedures */,
+'V'/* Views */,
+'TR'/* Triggers */,
+'FN', 'IF', 'TF' /* Functions */)
+AND ObjDef LIKE '%<pattern to Serach>%' /* String to be searched */
+ORDER BY CHARINDEX('F', TYPE)
+DESC /* Group the functions together */, ObjType, ObjName
+
+
+--***************************************************************************
+--Get Server Configurations
+--***************************************************************************
+CREATE TABLE #SERVER_CONFIG (
+  Name varchar(100),
+  minimumAllowed bigint,
+  maximumAllowed bigint,
+  ConfiguredValue bigint,
+  RunValue bigint
+)
+INSERT INTO #SERVER_CONFIG
+EXEC sp_configure
+
+;
+WITH HARDWAREINFO
+AS (SELECT
+  (cpu_count / hyperthread_ratio) AS Number0fPhysicalCPUs,
+  CASE
+    WHEN hyperthread_ratio = cpu_count THEN cpu_count
+    ELSE ((cpu_count - hyperthread_ratio) / (cpu_count / hyperthread_ratio)
+      )
+  END AS NumberOfCoresInEachCPU,
+  CASE
+    WHEN hyperthread_ratio = cpu_count THEN cpu_count
+    ELSE (cpu_count / hyperthread_ratio) * ((cpu_count / hyperthread_ratio)
+      / (cpu_count / hyperthread_ratio))
+  END AS TotalNumberOfCores,
+  cpu_count AS NumberofLogicalCPUs,
+  CONVERT(money, ROUND(physical_memory_in_bytes / 1073741824.0, 0)) AS
+  TotalRAMInGB
+FROM sys.dm_os_sys_info)
+
+
+SELECT
+  H.*,
+  SC.RunValue / 1024 AllocatedMemoryGB,
+  SC2.RunValue MDOP
+FROM HARDWAREINFO H
+JOIN #SERVER_CONFIG SC
+  ON 1 = 1
+JOIN #SERVER_CONFIG SC2
+  ON 1 = 1
+WHERE SC2.Name = 'max degree of parallelism'
+AND SC.Name = 'max server memory (MB)'
+
+DROP TABLE #SERVER_CONFIG
+
+--***************************************************************************
+--Get Details with Execution plan for currently Running Queries
+--***************************************************************************
+SELECT
+  --IDs and Blocking IDs
+  sess.session_id sess,
+  -- req.estimated_completion_time,
+  CASE estimated_completion_time
+    WHEN 0 THEN NULL
+    ELSE CONVERT(varchar(20), DATEADD(ms, req.estimated_completion_time, GETDATE()), 20)
+  END AS [Est.Completion Time],
+  req.percent_complete 'WComplete',
+  req.blocking_session_id blocking_sess,
+  DB_NAME(req.database_id) AS database_name,
+  --Text and Plan
+  SUBSTRING(qt.text, (statement_start_offset / 2) + 1,
+  (CASE
+    WHEN statement_end_offset = -1. THEN LEN(CONVERT(nvarchar(max), qt.text)) * 2
+    ELSE statement_end_offset
+  END - statement_start_offset) / 2) AS 'Statement',
+  qt.text AS query_text,
+  qp.query_plan AS query_plan,
+  --statement_start_offset, statement_end_offset,
+
+  --State information
+  --LEFT (tasks.task_state, 10) AS task_state,
+  LEFT(req.status, 15) AS req_status,
+  LEFT(sess.status, 15) AS sess_status,
+  req.executing_managed_code,
+
+  --Session information
+  sess.login_time,
+  sess.is_user_process,
+  LEFT(ISNULL(sess.[host_name], ''), 20) AS [host_name],
+  LEFT(ISNULL(sess.[program_name], ''), 50) AS [program_name],
+  LEFT(ISNULL(sess.login_name, ''), 30) AS login_name,
+
+  -- Waits information
+  LEFT(ISNULL(req.wait_type, ''), 45) AS wait_type,
+  LEFT(ISNULL(req.last_wait_type, ''), 45) AS last_wait_type,
+  ISNULL(waits.wait_duration_ms, 0) AS wait_duration_ms,
+  LEFT(ISNULL(req.wait_resource, ''), 50) AS wait_resource,
+  LEFT(ISNULL(waits.resource_description, ''), 140) AS resource_description,
+
+  -- Transaction information
+  req.transaction_id,
+  ISNULL(req.open_transaction_count, 0) AS open_transaction_count,
+  COALESCE(req.transaction_isolation_level,
+  sess.transaction_isolation_level) AS transaction_isolation_level,
+
+  --Request stats
+  req.cpu_time AS request_cpu_time,
+  req.logical_reads AS request_logical_reads,
+  req.reads AS request_reads,
+  req.writes AS request_writes,
+  req.total_elapsed_time AS request_total_elapsed_time,
+  req.start_time AS request_start_time,
+
+  -- Session stats
+  sess.memory_usage,
+  sess.cpu_time AS session_cpu_time,
+  sess.reads AS session_reads,
+  sess.writes AS session_writes,
+  sess.logical_reads AS session_logical_reads,
+  sess.total_scheduled_time AS session_total_scheduled_time,
+  sess.total_elapsed_time AS session_total_elapsed_time,
+  sess.last_request_start_time AS session_last_request_start_time,
+  sess.last_request_end_time AS session_last_request_end_time,
+  req.open_resultset_count AS open_resultsets,
+  sess.row_count AS session_row_count,
+  sess.prev_error,
+
+  -- Tempdb utilization
+  tempdb_sess.user_objects_alloc_page_count +
+  tempdb_sess.user_objects_dealloc_page_count
+  AS 'sess_user_objects_page_count_in_tempdb',
+  tempdb_sess.internal_objects_alloc_page_count +
+  tempdb_sess.internal_objects_dealloc_page_count
+  AS
+  'sess_internal_objects_page_count_in_tempdb',
+  tempdb_task.User_objects_page_count_in_tempdb AS
+  'req_user_objects_page_count_in_tempdb',
+  tempdb_task.Internal_objects_page_count_in_tempdb AS
+  'req_internal_objects_page_count_in_tempdb',
+
+  -- Misc
+  req.request_id,
+  --tasks.exec_context_id,
+  ISNULL(waits.blocking_exec_context_id, 0) AS
+  blocking_exec_context_id,
+  --tasks.pending_io_count,
+  --tasks.scheduler_id,
+  req.[user_id]
+FROM sys.dm_exec_sessions sess (NOLOCK)
+LEFT OUTER MERGE JOIN sys.dm_exec_requests req (NOLOCK)
+  ON sess.session_id = req.session_id
+--LEFT OUTER MERGE JOIN sys.dm_os_tasks tasks (nolock)
+-- ON tasks.session_id = sess.session_id
+-- AND tasks.request_id req.request_id
+LEFT OUTER MERGE JOIN sys.dm_os_waiting_tasks waits (NOLOCK)
+  ON waits.waiting_task_address = req.task_address
+LEFT OUTER MERGE JOIN sys.dm_db_session_space_usage tempdb_sess
+(NOLOCK)
+  ON tempdb_sess.session_id = sess.session_id
+LEFT OUTER MERGE JOIN (SELECT
+  session_id,
+  request_id,
+  SUM(user_objects_alloc_page_count +
+  user_objects_dealloc_page_count)
+  AS
+  'User_objects_page_count_in_tempdb',
+  SUM(internal_objects_alloc_page_count +
+  internal_objects_dealloc_page_count)
+  AS
+  'Internal_objects_page_count_in_tempdb'
+
+FROM sys.dm_db_task_space_usage
+GROUP BY session_id,
+         request_id) AS
+tempdb_task
+  ON tempdb_task.session_id = sess.session_id
+  AND (tempdb_task.request_id = req.request_id)
+CROSS APPLY sys.dm_exec_sql_text(req.sql_handle) AS qt
+OUTER APPLY sys.dm_exec_query_plan(req.plan_handle) AS qP
+WHERE req.session_id <> WSPID
+AND ((req.session_id IS NOT NULL
+AND (sess.is_user_process = 1
+OR req.status COLLATE Latinl_General_BIN NOT IN
+('background', 'sleeping')))-- active request
+OR (sess.session_id IN (SELECT DISTINCT
+  blocking_session_id
+FROM sys.dm_exec_requests(nolock)
+WHERE blocking_session_id != 0)
+)) --not active, but head blocker
+ORDER BY sess.session_id, request_id, exec_context_id
+OPTION (FORCE ORDER) -- redundant due to the use of join hints, but added here to suppress warning message
+
+
+--***************************************************************************
+--Check All Indexes and details on all tables
+--***************************************************************************
+with cte as
+(
+Select
+schemanm=schema_name(o.schema_id),table_name = o.name,
+o.[object_id],i.index_id,i.type,i.type_desc
+from sys.indexes i
+inner join sys.objects o on i.[object_id] =o.[object_id]
+where o.type in ('U') and o.is_ms_shipped = 0 and i.is_disabled = 0 and
+i.is_hypothetical = 0 and i.type <=2
+),
+cte2 as(
+select * from cte c
+pivot (count (type) for type_desc in ([HEAP] [CLUSTERED], [NONCLUSTERED])) pv
+)
+Select c2.schemanm,c2.table_name,
+[rows] = max(p.rows),
+is_heap = sum([HEAP]),
+is_clustered = sum([CLUSTERED]),
+num_of_nonclustered = sum([NONCLUSTERED])
+from cte2 c2
+inner join sys.partitions p on c2.[object_id] = p.[object_id] and c2.index_id=p.index_id
+group by schemanm,table_name
+
+--***************************************************************************
+--Check size of the table
+--***************************************************************************
+DECLARE @TableName varchar(100) --For storing values in the cursor
+--Cursor to get the name of all user tables from the sysobjects listing
+DECLARE tableCursor CURSOR FOR
+SELECT
+  SCHEMA_NAME(t.schema_id) + '.' + t.name
+FROM sys.tables t
+WHERE SCHEMA_NAME(t.schema_id) <> 'Archive'
+FOR READ ONLY
+
+--A procedure level temp table to store the results
+CREATE TABLE #TempTable (
+  tableName varchar(100),
+  numberofRows varchar(100),
+  reservedSize varchar(50),
+  dataSize varchar(50),
+  indexSize varchar(50),
+  unusedSize varchar(50)
+)
+--Open the cursor
+OPEN tableCursor
+--Get the first table name fr om the cu rs or
+FETCH NEXT FROM tableCursor INTO @TableName
+--Loop until the cursor was not able to fetch
+WHILE (@@Fetch_Status >= 0)
+BEGIN
+  --Dump the results of the sp_spaceused query to the temP table
+  INSERT #TempTable
+  EXEC sp_spaceused @TableName
+  --Get the next table na me
+  FETCH NEXT FROM tableCursor INTO @TableName
+END
+--Get rid of the cursor
+CLOSE tableCursor
+DEALLOCATE tableCursor
+--Select all records so we can use the re ul ts
+UPDATE #TempTable
+SET dataSize = REPLACE(dataSize, ' KB', '')
+SELECT
+  tableName,
+  numberofRows,
+  reservedSize,
+  dataSize / 1024 sizeinMB,
+  indexSize,
+  unusedSize
+FROM #TempTable
+WHERE dataSize > 1048576
+ORDER BY dataSize DESC
+
+--Final cleanup!
+DROP TABLE #TempTable
+--***************************************************************************
+--CHeck Transaction log si ze
+--***************************************************************************
+DBCC SQLPERF (LOGSPACE);
+--***************************************************************************
+--Unrestrict DB from Restricted mode
+--***************************************************************************
+ALTER DATABASE DBNAME SET MULTI_USER
+
+--***************************************************************************
+--List all underlying tables for a view/SP
+--***************************************************************************
+DECLARE @referencing_entity AS sysname;
+DECLARE @referencing_schema AS sysname
+SET @referencing_entity = '<object name>'
+SET @referencing_schema = '<schema name>';
+WITH ObjectDepends (entity_type, entity_name, referenced_entity_type, referenced_schema, referenced_entity, referenced_id, level)
+AS (SELECT
+  entity_type = ob.type,
+  entity_name =
+               CASE referencing_class
+                 WHEN 1 THEN OBJECT_NAME(referencing_id)
+                 WHEN 12 THEN (SELECT
+                     t.name
+                   FROM sys.triggers AS t
+                   WHERE t.object_id = sed.referencing_id)
+                 WHEN 13 THEN (SELECT
+                     st.name
+                   FROM sys.server_triggers AS st
+                   WHERE st.object_id = sed.referencing_id)
+                   COLLATE
+                   database_default
+               END,
+  referenced_entity_type = obr.type,
+  referenced_schema_name,
+  referenced_entity_name,
+  referenced_id,
+  0 AS level
+FROM sys.sql_expression_dependencies AS sed
+JOIN sys.objects AS ob
+  ON ob.object_id = sed.referencing_id
+JOIN sys.objects AS obr
+  ON obr.object_id = sed.referenced_id
+WHERE OBJECT_NAME(sed.referencing_id) = @referencing_entity
+AND SCHEMA_NAME(ob.schema_id) = @referencing_schema
+UNION ALL
+SELECT
+  entity_type = ob.type,
+  entity_name =
+               CASE sed.referencing_class
+                 WHEN 1 THEN OBJECT_NAME(sed.referencing_id)
+                 WHEN 12 THEN (SELECT
+                     t.name
+                   FROM sys.triggers AS t
+                   WHERE t.object_id = sed.referencing_id)
+                 WHEN 13 THEN (SELECT
+                     st.name
+                   FROM sys.server_triggers AS St
+                   WHERE st.object_id = sed.referencing_id)
+                   COLLATE
+                   database_default
+               END,
+  referenced_entity_type = obr.type,
+  sed.referenced_schema_name,
+  sed.referenced_entity_name,
+  sed.referenced_id,
+  level + 1
+FROM ObjectDepends AS o
+JOIN sys.sql_expression_dependencies AS sed
+  ON sed.referencing_id =
+  o.referenced_id
+JOIN sys.objects AS obr
+  ON obr.object_id = sed.referenced_id
+JOIN sys.objects AS ob
+  ON ob.object_id = sed.referencing_id
+  AND ob.type IN ('V', 'IF', 'FN'))
+
+SELECT DISTINCT
+  referenced_schema,
+  referenced_entity
+FROM ObjectDepends
+WHERE referenced_entity_type = 'U'
+OPTION (MAXRECURSION 327)
+--***************************************************************************
+--Get Physical Name of the Server
+--***************************************************************************
+SELECT
+  SERVERPROPERTY('ComputerNamePhysicalNetBIOS')
