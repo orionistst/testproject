@@ -1,0 +1,312 @@
+-------------------1
+CREATE PROCEDU RE [Admin]. IpArchiveTableByDate]
+(
+@dbname sysname,
+@StagingSchemaName sysname,
+@StagingTableName sysname,
+@FilterColumn Name sysname,
+@ArchiveSchemaName sysname,
+@ArchiveTableName sysname,
+@MoveToArchivebit = 1,
+@stagingadditionalfilternvarchar(3000),
+@archiveadditionalfilternvarchar(3000),
+@BatchSize int = 10000,
+@stagingjoin NVARCHAR(3000),
+@archivejoin NVARCHAR(3000),
+@stagingcutoffdate DATE,
+@archivecutoffdate DATE,
+@additional_staging_date_filter VARCHAR (5000),
+@additional_archive_date_filter VARCHAR(5000)
+)
+AS
+BEGIN
+SET NOCOUNT ON
+/* verify the filter column */
+DECLARE @ColumnType SYSNAME
+DECLARE @errmsg NVARCHAR(2000)
+
+-----------2
+
+lF @FilterColumnName IS NOT NULL
+BEGIN
+SELECT
+@ColumnType = c.DATA_TypE
+FROM
+INFORMATION_SCHEMA.COLUMNS c
+INNER JOIN sys.objects o
+ON o.name = c.TABLE_NAME
+AND SCHEMA_NAME(o.schema_id) = c.TABLE_SCHEMA
+WHERE
+o.schema_id = SCHEMA_ID(@StagingSchemaName)
+AND o.name = @stagingTableName
+AND c.COLUMN_NAME = @FilterColumnName
+
+IF @ColumnType NOT LIKE %date%,
+RAISERROR('Table %s.%s, column %s is not of a date type', 16, 1, @StagingSchemaName, @StagingTableName, @FilterColumnName) WITH NOWATT
+END
+
+IF @stagingadditionalfilter IS NULL
+	SET @stagingadditionalfilter =''
+
+IF @archiveadditionalfilter lS NULL
+	SET @archiveadditionalfilter=''
+
+IF @additional_staging_date_filter IS NULL
+	SET @additional_staging_date_filter =''
+
+-----------------3
+
+IF @additional_archive_date_filter lS NULL
+	SET @additional_archive date filter=''
+
+IF @stagingjoin IS NULL
+	SET @stagingjoin=''
+
+IF @archivejoin IS NULL
+	SET @archivejoin=''
+
+IF @FilterColumnName IS NULL
+	SET @FilterColumnName=''
+
+IF @stagingcutoffdate IS NULL
+	SET @stagingcutoffdate=''
+
+IF @archivecutoffdate IS NULL
+	SET @archivecutoffdate=''
+
+IF @dbname IS NULL
+	SET @dbname=''
+
+BEGIN TRY
+	DECLARE @sql NVARCHAR(MAX)
+	DECLARE @cotumns NVARCHAR(MAX)
+	DECLARE @template NVARCHAR(MAX)
+	DECLARE @table_name NVARCHAR(500)
+	DECLARE @archivetable_name NVARCHAR(500)
+
+-------4
+
+SET @table_name = @StagingSchemaName +'.'+ @StagingTableName
+SET @archivetable_name = @ArchiveSchemaName+'.'+@ArchiveTableName
+
+/* Get Column list */
+
+IF @MoveToArchive = 0
+	SET @columns =[Admin].[fnGetColumnstoArchive] (@StagingSchemaName, @StagingTableName,NULL,NULL,'T')
+ELSE
+	SET @columns = [Admin].[fnGetColumnstoArchive](@StagingSchemaName, @StagingTableName , @ArchiveSchemaName, @ArchiveTableName,'T')
+
+	IF @archivetable_name IS NULL
+		SET @archivetable_name=''
+	IF @movetoarchive = 0
+	BEGIN
+		IF @ FilterColumnName=''
+		BEGIN
+			SET @template = N'SET NOCOUNT ON
+			declare @batchSize int
+			SET @batchSize = %batchSize
+			DECLARE @rc BIGINT
+			WHILE 1=1
+			BEGIN
+				DELETE TOP (@batchSize)T FROM %tablename T %stagingjoin
+				WHERE 1=l %stagingadditionalfilter
+
+----------5
+
+				%additional_staging_date_filter
+				SET @rc = @@ROWCOUNT
+				IF(@rc = 0)
+					BREAK;
+			END'
+	END
+	ELSE
+	BEGIN
+		SET @template = N'SET NOCOUNT ON
+		declare @batchSize int
+		SET @batchSize = %batchSize
+		DECLARE @rc BIGINT
+		WHILE 1=1
+		BEGIN
+			DELETE TOP (@batchSize)T FROM %tablename T %stagingjoin
+			WHERE 1=1 %stagingadditionalfilter
+			AND T.%filterColumn < "%stagingcutoffdate" %additional_staging_date_filter
+			SET @rc = @@ROWCOUNT
+			IF(@rc = 0)
+				BREAK;
+		END'
+	END
+END
+ELSE
+BEGIN
+	IF @FilterColumnName=''
+
+-------------------6
+
+	BEGIN
+		SET @template = N'SET NOCOUNT ON
+		DECLARE @batchSize INT
+		SET @batchSize = %batchSize
+		DECLARE @ISRollback INT
+		SET @ISRollback = 0
+		BEGIN TRY
+		BEGIN TRAN
+			--Move data to Archive table
+			INSERT INTO %archivetableName (%columnlist)
+			SELECT %columnlist FROM %tablename T %stagingjoin
+			WHERE 1=l
+			%staginga d d ition a lfilter
+		COMMIT TRAN
+		END TRY
+		BEGIN CATCH
+			ROLLBACK TRAN
+			SET @lsRollback = 1
+		END CATCH
+		IF @lSRollback = 0
+		BEGIN
+		BEGIN TRY
+			DECLARE @rc BIGINT
+			WHILE 1=1
+			BEGIN
+---------------------7
+
+				DELETE TOP (@batchSize)T FROM %tablename T %stagingjoin
+				WHERE 1=1 %stagingadditionalfilter
+				%additional_staging_date_filter
+				SET @rc = @@ROWCOUNT
+				IF(@rc = 0)
+					BREAK;
+				END
+		END TRY
+		BEGIN CATCH
+			SET @ISRollback = i
+		END CATCH
+		IF @lSRollback = 0
+		BEGIN
+		WHILE 1=1
+		BEGIN
+			DELETE TOP (@batchSize)T FROM %archivetableName T %archivejoin
+			WHERE 1=1 %archiveadditionalfilter
+			%additional_archive_date_filter
+			SET @rc = @@ROWCOUNT
+			IF(@rc = 0)
+				BREAK;
+			END
+		END'
+		
+		END
+	ELSE
+--------------8
+
+	BEGIN
+		SET @template = N'
+			SET NOCOUNT ON
+			DECLARE @batchSize INT
+			DECLARE @COUNTER INT
+			DECLARE @CNT rNT
+			DECLARE @COBDATE DATE
+			DECLARE @lSRollback INT
+			DECLARE @PURGECOUNTER INT
+			DECLARE @PURGECNT INT
+			DECLARE @PURGECOBDATE DATE
+			DECLARE @PURGElSRollback INT
+			DECLARE @PurgeTotalCnt INT
+			DECLARE @TotalCnt INT
+			DECLARE @rc INT
+			SET @batchSize = %batchSize
+			SET @ISRollback = 0
+			
+			CREATE TABLE #COBDATESTOARCHIVE (I D INT IDENTITY(1, L),COBDATE DATE)
+			INSERT INTO #COBDATESTOARCHIVE
+			SELECT DISTINCT
+				CAST(T.%f|lterColumn AS DATE) AS COBDATE
+			FROM
+			%tablename T %stagingjoin
+			WHERE CAST(T.%filterColumn AS DATE) < ''%stagingcutoffdate'' %stagingadditionalfilter
+			%additional_staging_date_filter
+
+----------------------9
+
+			SELECT @CNT = COUNT(lD) FROM #COBDATESTOARCHIVE
+			SET @COUNTER = 1
+			WHILE (@COUNTER <= @CNT) AND (@ISRollback = 0)
+			BEGIN
+				SELECT @COBDATE = COBDATE FROM #COBDATESTOARCHIVE WHERE lD = @COUNTER
+				SELECT @TotalCnt = Count(*) FROM %tablename T %stagingjoin
+				WHERE CAST(T.%filterColumn AS DATE) = @COBDATE
+				%stagingadditionalfilter
+				WHILE (@TotalCnt <> 0)
+				BEGIN
+					BEGIN TRY
+					BEGIN TRAN
+					--Move data to Archive table
+					INSERT INTO %archivetableName (%columnlist)
+					SELECT TOP (@batchSize) %columnlist FROM %tablename T %stagingjoin
+					WHERE 1=1
+					AND CAST(T.%f|lterColumn AS DATE) = @COBDATE
+					%stagingadditionalfilter
+					--Delete data from Staging
+					DELETE TOP (@batchSize) T FROM %tableName T %stagingjoin
+					WHERE 1=1
+					AND CAST(T.%f|lterColumn AS DATE) = @COBDATE
+					%stagingadditionalfilter
+					COMMIT TRAN
+					END TRY
+					BEGIN CATCH
+
+---------------------10
+
+						ROLLBACK TRAN
+						SET @lSRollback = 1
+						RETURN;
+					END CATCH
+					SELECT @TotalCnt = Count(*) FROM %tablename T %stagingjoin
+					WHERE CAST(T.%filterColumn AS DATE) = @COBDATE
+					%stagingadditionalfilter
+					IF (@TotalCnt = 0)
+					BEGIN
+						break;
+					END
+				END
+				DELETE FROM #COBDATESTOARCHIVE WHERE lD = @COUNTER
+				SET @COUNTER = @COUNTER + 1
+				END
+				DROP TABLE #COBDATESTOARCH IVE
+				/* Module for Purge Archive*/
+			IF @lSRollback = 0
+			BEGIN
+			WHILE 1=1
+			BEGIN
+				DELETE TOP (@batchSize)T FROM %archivetableName T %archivejoin
+				WHERE 1=1 %archiveadditionalfilter
+				AND T.%filterColumn < ''%archivecutoffdate'' %additionalarchivedate
+				SET @rc = @@ROWCOUNT
+				IF(@rc = 0)
+					BREAK;
+			END
+------------------11
+
+			END'
+
+		END
+	END
+		SELECT @sql = REPLACE(@template,'%tablename', @table_name )
+		SELECT @sql = REPLACE(@sql, '%oarchivetableName' , @archivetable-name )
+		SELECT @sql = REPLACE(@sql,'%filterColumn', @FilterColumnName)
+		SELECT @sql = REPLACE(@sql, '%batchSize' , @BatchSize)
+		SELECT @sql = REPLACE(@sql,'%stagingcutoffdate', @stagingcutoffdate)
+		SELECT @sql = REPLACE(@sql,'%archivecutoffdate', @archivecutoffdate)
+		SELECT @sql = REPLACE(@sql, '%stagingjoin' , @stagingjoin)
+		SELECT @sql = REPLACE(@sql, '%archivejoin' , @archivejoin)
+		SELECT @sql = REPLACE(@sql, '%stagingadditionalfilter' , @stagingadditionalfilter)
+		SELECT @sql = REPLACE(@sql, '%archiveadditionalfilter' , @archiveadditionalfilter)
+		SELECT @sql = REPLACE(@sql, '%columnlist' , @columns)
+		SELECT @sql = REPLACE(@sql, '%additional_staging_date-filter' , @additional_staging_date_filter)
+		SELECT @sql = REPLACE(@sql, '%additional_archive_date_filter' , @additional_archive_date_filter)
+		EXEC sp_executesql @sql
+		--SELECT @sql
+END TRY
+BEGIN CATCH
+	SET @errmsg = 'Exception: Archiving' + quotename(@StagingschemaName)+'.'+quotename(@StagingTableName) +'failed: '+char(1-0) + error-message() + '(error number: ' + convert(nvarchar, error-number()) + ')'
+	RAISERROR(@errmsg, 16, 1)
+END CATCH
+END
